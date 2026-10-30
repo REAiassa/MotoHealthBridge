@@ -28,6 +28,7 @@ import android.widget.TextView
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.ArrayDeque
 import java.util.UUID
 
 class MainActivity : Activity() {
@@ -39,6 +40,8 @@ class MainActivity : Activity() {
     private val seen = linkedMapOf<String, String>()
     private var scanning = false
     private var scanner: BluetoothLeScanner? = null
+    private val standardReadQueue = ArrayDeque<BluetoothGattCharacteristic>()
+    private val reportBuffer = StringBuilder()
 
     companion object {
         private const val REQUEST_PERMISSIONS = 501
@@ -59,7 +62,7 @@ class MainActivity : Activity() {
             setPadding(24, 24, 24, 24)
         }
         val title = TextView(this).apply {
-            text = "MotoHealthBridge · P0.2"
+            text = "MotoHealthBridge · P0.3"
             textSize = 24f
         }
         status = TextView(this).apply {
@@ -268,22 +271,83 @@ class MainActivity : Activity() {
                 runOnUiThread { status.text = "Falló el descubrimiento GATT: código $statusCode" }
                 return
             }
-            val report = StringBuilder()
-            report.append("Moto Watch 120-70DA\n")
-            report.append("Dirección: $WATCH_ADDRESS\n")
-            report.append("Servicios encontrados: ${bluetoothGatt.services.size}\n\n")
+            reportBuffer.setLength(0)
+            reportBuffer.append("Moto Watch 120-70DA\n")
+            reportBuffer.append("Dirección: $WATCH_ADDRESS\n")
+            reportBuffer.append("Servicios encontrados: ${bluetoothGatt.services.size}\n\n")
             bluetoothGatt.services.forEachIndexed { index, service ->
-                report.append("Servicio ${index + 1}: ${service.uuid}\n")
+                reportBuffer.append("Servicio ${index + 1}: ${service.uuid}\n")
                 service.characteristics.forEach { characteristic ->
-                    report.append("  Característica: ${characteristic.uuid}\n")
-                    report.append("  Propiedades: ${propertyNames(characteristic)}\n")
+                    reportBuffer.append("  Característica: ${characteristic.uuid}\n")
+                    reportBuffer.append("  Propiedades: ${propertyNames(characteristic)}\n")
                 }
-                report.append("\n")
+                reportBuffer.append("\n")
             }
+
+            // Read only standard Bluetooth Device Information characteristics.
+            // No proprietary characteristics are read or written in this experiment.
+            standardReadQueue.clear()
+            val deviceInfo = bluetoothGatt.getService(UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb"))
+            val standardIds = listOf(
+                "00002a24-0000-1000-8000-00805f9b34fb",
+                "00002a29-0000-1000-8000-00805f9b34fb",
+                "00002a50-0000-1000-8000-00805f9b34fb"
+            )
+            standardIds.forEach { id ->
+                deviceInfo?.getCharacteristic(UUID.fromString(id))?.let { standardReadQueue.add(it) }
+            }
+            reportBuffer.append("LECTURAS ESTÁNDAR DE IDENTIFICACIÓN\n")
             runOnUiThread {
-                status.text = "Descubrimiento GATT completado. No se leyeron ni modificaron características."
-                results.text = report.toString()
+                status.text = "GATT descubierto. Leyendo identificación estándar del dispositivo…"
+                results.text = reportBuffer.toString()
             }
+            readNextStandardCharacteristic(bluetoothGatt)
+        }
+
+        override fun onCharacteristicRead(
+            bluetoothGatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            statusCode: Int
+        ) {
+            val bytes = characteristic.value ?: byteArrayOf()
+            val hex = bytes.joinToString(" ") { "%02X".format(it) }
+            val decoded = bytes.toString(Charsets.UTF_8).trimEnd('\u0000', ' ')
+            val label = when (characteristic.uuid.toString().lowercase(Locale.ROOT)) {
+                "00002a24-0000-1000-8000-00805f9b34fb" -> "Model Number (2A24)"
+                "00002a29-0000-1000-8000-00805f9b34fb" -> "Manufacturer Name (2A29)"
+                "00002a50-0000-1000-8000-00805f9b34fb" -> "PnP ID (2A50)"
+                else -> characteristic.uuid.toString()
+            }
+            reportBuffer.append("$label: ")
+            if (statusCode == BluetoothGatt.GATT_SUCCESS) {
+                reportBuffer.append("HEX=[$hex]  TEXTO=[$decoded]\n")
+            } else {
+                reportBuffer.append("lectura fallida, código=$statusCode\n")
+            }
+            runOnUiThread { results.text = reportBuffer.toString() }
+            readNextStandardCharacteristic(bluetoothGatt)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readNextStandardCharacteristic(bluetoothGatt: BluetoothGatt) {
+        if (standardReadQueue.isEmpty()) {
+            runOnUiThread {
+                status.text = "P0.3 terminado. Solo se leyeron características estándar; no se enviaron comandos propietarios."
+                results.text = reportBuffer.toString()
+            }
+            return
+        }
+        val characteristic = standardReadQueue.removeFirst()
+        try {
+            val started = bluetoothGatt.readCharacteristic(characteristic)
+            if (!started) {
+                reportBuffer.append("No se pudo iniciar lectura de ${characteristic.uuid}\n")
+                readNextStandardCharacteristic(bluetoothGatt)
+            }
+        } catch (e: SecurityException) {
+            reportBuffer.append("Permiso denegado al leer ${characteristic.uuid}: ${e.message}\n")
+            readNextStandardCharacteristic(bluetoothGatt)
         }
     }
 

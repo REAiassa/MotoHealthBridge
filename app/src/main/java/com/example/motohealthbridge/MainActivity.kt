@@ -8,6 +8,8 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.content.Intent
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
@@ -41,6 +43,20 @@ class MainActivity : Activity() {
     private var scanning = false
     private var scanner: BluetoothLeScanner? = null
     private val standardReadQueue = ArrayDeque<BluetoothGattCharacteristic>()
+    private val notificationQueue = ArrayDeque<BluetoothGattCharacteristic>()
+    private var pendingDescriptorCharacteristic: BluetoothGattCharacteristic? = null
+    private var captureActive = false
+    private var pendingPermissionAction: (() -> Unit)? = null
+    private val captureLog = StringBuilder()
+    private val captureTargets = listOf(
+        "0000ffd2-0000-1000-8000-00805f9b34fb",
+        "0000ffd3-0000-1000-8000-00805f9b34fb",
+        "e49a3003-f69a-11e8-8eb2-f2801f1b9fd1",
+        "e49a28e1-f69a-11e8-8eb2-f2801f1b9fd1",
+        "000035f2-0000-1000-8000-00805f9b34fb",
+        "000034f2-0000-1000-8000-00805f9b34fb",
+        "0000aa03-0000-1000-8000-00805f9b34fb"
+    )
     private val reportBuffer = StringBuilder()
 
     companion object {
@@ -62,7 +78,7 @@ class MainActivity : Activity() {
             setPadding(24, 24, 24, 24)
         }
         val title = TextView(this).apply {
-            text = "MotoHealthBridge · P0.3"
+            text = "MotoHealthBridge · P0.4"
             textSize = 24f
         }
         status = TextView(this).apply {
@@ -76,6 +92,14 @@ class MainActivity : Activity() {
         val connectButton = Button(this).apply {
             text = "Conectar al Moto Watch 120 y descubrir GATT"
             setOnClickListener { connectToWatch() }
+        }
+        val captureButton = Button(this).apply {
+            text = "Activar captura pasiva BLE"
+            setOnClickListener { startPassiveCapture() }
+        }
+        val shareButton = Button(this).apply {
+            text = "Compartir registro"
+            setOnClickListener { shareCaptureLog() }
         }
         val disconnectButton = Button(this).apply {
             text = "Desconectar del reloj"
@@ -103,6 +127,8 @@ class MainActivity : Activity() {
         root.addView(status)
         root.addView(scanButton)
         root.addView(connectButton)
+        root.addView(captureButton)
+        root.addView(shareButton)
         root.addView(disconnectButton)
         root.addView(clearButton)
         root.addView(scroll, LinearLayout.LayoutParams(
@@ -133,6 +159,7 @@ class MainActivity : Activity() {
             return
         }
         if (!hasPermissions()) {
+            pendingPermissionAction = { startScan() }
             requestPermissions(requiredPermissions(), REQUEST_PERMISSIONS)
             return
         }
@@ -208,8 +235,9 @@ class MainActivity : Activity() {
     @SuppressLint("MissingPermission")
     private fun connectToWatch() {
         if (!hasPermissions()) {
+            pendingPermissionAction = { connectToWatch() }
             requestPermissions(requiredPermissions(), REQUEST_PERMISSIONS)
-            status.text = "Concedé los permisos Bluetooth y volvé a tocar Conectar."
+            status.text = "Solicitando permisos Bluetooth…"
             return
         }
         if (scanning) stopScan("Escaneo detenido antes de conectar.")
@@ -304,6 +332,20 @@ class MainActivity : Activity() {
             readNextStandardCharacteristic(bluetoothGatt)
         }
 
+        override fun onDescriptorWrite(bluetoothGatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, statusCode: Int) {
+            appendCapture("[" + timestamp() + "] CCCD " + descriptor.characteristic.uuid + " status=" + statusCode)
+            pendingDescriptorCharacteristic = null
+            subscribeNextNotification(bluetoothGatt)
+        }
+
+        override fun onCharacteristicChanged(bluetoothGatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            recordNotification(characteristic, characteristic.value ?: byteArrayOf())
+        }
+
+        override fun onCharacteristicChanged(bluetoothGatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            recordNotification(characteristic, value)
+        }
+
         override fun onCharacteristicRead(
             bluetoothGatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
@@ -327,6 +369,102 @@ class MainActivity : Activity() {
             runOnUiThread { results.text = reportBuffer.toString() }
             readNextStandardCharacteristic(bluetoothGatt)
         }
+    }
+
+    private fun startPassiveCapture() {
+        if (!hasPermissions()) {
+            pendingPermissionAction = { startPassiveCapture() }
+            requestPermissions(requiredPermissions(), REQUEST_PERMISSIONS)
+            status.text = "Solicitando permisos Bluetooth para iniciar captura…"
+            return
+        }
+        val current = gatt
+        if (current == null) {
+            status.text = "Primero conectá el reloj y esperá el descubrimiento GATT."
+            return
+        }
+        if (captureActive) {
+            status.text = "La captura pasiva ya está activa."
+            return
+        }
+        captureActive = true
+        captureLog.setLength(0)
+        captureLog.append("MotoHealthBridge P0.4 - captura pasiva BLE\n")
+        captureLog.append("Reloj Moto Watch 120-70DA; inicio " + timestamp() + "\n")
+        notificationQueue.clear()
+        for (id in captureTargets) {
+            val uuid = UUID.fromString(id)
+            for (service in current.services) {
+                val ch = service.getCharacteristic(uuid)
+                if (ch != null && ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+                    notificationQueue.add(ch)
+                    break
+                }
+            }
+        }
+        appendCapture("Canales NOTIFY encontrados: " + notificationQueue.size + " de " + captureTargets.size)
+        status.text = "Configurando notificaciones CCCD en secuencia…"
+        subscribeNextNotification(current)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun subscribeNextNotification(bluetoothGatt: BluetoothGatt) {
+        if (!captureActive || pendingDescriptorCharacteristic != null) return
+        if (notificationQueue.isEmpty()) {
+            status.text = "Captura pasiva BLE activa. No se enviaron comandos propietarios."
+            appendCapture("Configuración CCCD finalizada.")
+            return
+        }
+        val ch = notificationQueue.removeFirst()
+        val cccd = ch.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+        if (cccd == null) {
+            appendCapture("Sin CCCD para " + ch.uuid + "; omitida.")
+            subscribeNextNotification(bluetoothGatt)
+            return
+        }
+        try {
+            if (!bluetoothGatt.setCharacteristicNotification(ch, true)) {
+                appendCapture("No se pudo habilitar localmente " + ch.uuid)
+                subscribeNextNotification(bluetoothGatt)
+                return
+            }
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            pendingDescriptorCharacteristic = ch
+            if (!bluetoothGatt.writeDescriptor(cccd)) {
+                pendingDescriptorCharacteristic = null
+                appendCapture("No se pudo iniciar escritura CCCD " + ch.uuid)
+                subscribeNextNotification(bluetoothGatt)
+            }
+        } catch (e: Exception) {
+            pendingDescriptorCharacteristic = null
+            appendCapture("Error CCCD " + ch.uuid + ": " + e.message)
+            subscribeNextNotification(bluetoothGatt)
+        }
+    }
+
+    private fun recordNotification(ch: BluetoothGattCharacteristic, value: ByteArray) {
+        val hex = value.joinToString(" ") { "%02X".format(it) }
+        appendCapture("[" + timestamp() + "] servicio=" + ch.service.uuid +
+            " característica=" + ch.uuid + " longitud=" + value.size + " HEX=[" + hex + "]")
+    }
+
+    private fun appendCapture(line: String) {
+        runOnUiThread {
+            captureLog.append(line).append("\n")
+            results.text = captureLog.toString()
+        }
+    }
+
+    private fun timestamp(): String =
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+
+    private fun shareCaptureLog() {
+        val body = if (captureLog.isNotEmpty()) captureLog.toString() else "No hay registro. Conectá el reloj e iniciá la captura pasiva BLE."
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, body)
+        }
+        startActivity(Intent.createChooser(send, "Compartir registro BLE"))
     }
 
     @SuppressLint("MissingPermission")
@@ -405,8 +543,12 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_PERMISSIONS) {
             if (hasPermissions()) {
-                status.text = "Permisos concedidos. Elegí escanear o conectar al reloj."
+                status.text = "Permisos concedidos."
+                val action = pendingPermissionAction
+                pendingPermissionAction = null
+                action?.invoke()
             } else {
+                pendingPermissionAction = null
                 status.text = "Faltan permisos. Concedelos desde los permisos de la aplicación."
             }
         }
@@ -414,6 +556,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         if (scanning) stopScan("Actividad cerrada.")
+        captureActive = false
+        pendingPermissionAction = null
         gatt?.let { closeGatt(it) }
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
